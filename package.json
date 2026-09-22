@@ -1,0 +1,24 @@
+{
+  "name": "realtime-voice-agent",
+  "version": "1.0.0",
+  "description": "Embeddable real-time voice AI agent (Gemini Live) trained on a website's own content",
+  "main": "server/index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server/index.js",
+    "dev": "node --watch server/index.js",
+    "postinstall": "npx playwright install chromium"
+  },
+  "dependencies": {
+    "@xenova/transformers": "^2.17.2",
+    "cheerio": "^1.2.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "playwright": "^1.62.1",
+    "uuid": "^9.0.1",
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": "22.x"
+  }
+}

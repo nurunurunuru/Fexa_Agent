@@ -1,0 +1,566 @@
+<!DOCTYPE html>
+<html lang="bn">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Customer Leads</title>
+<style>
+
+  :root {
+    --bg-1: #073d32;
+    --bg-2: #02231c;
+    --bg-3: #00130f;
+    --mint: #1dd1a1;
+    --mint-bright: #00ffb8;
+    --text: #eafff6;
+    --text-dim: rgba(234,255,246,.62);
+    --card: rgba(255,255,255,.035);
+    --border: rgba(255,255,255,.13);
+  }
+
+  * {
+    box-sizing: border-box;
+  }
+
+  html, body {
+    margin: 0;
+    padding: 0;
+  }
+
+  body {
+    min-height: 100vh;
+
+    font-family:
+      -apple-system, BlinkMacSystemFont,
+      "Segoe UI", Roboto, sans-serif;
+
+    color: var(--text);
+
+    background:
+      radial-gradient(circle at 8% 0%, rgba(0,255,184,.16), transparent 40%),
+      radial-gradient(circle at 100% 100%, rgba(0,255,170,.14), transparent 45%),
+      linear-gradient(160deg, var(--bg-1) 0%, var(--bg-2) 45%, var(--bg-3) 100%);
+
+    background-attachment: fixed;
+
+    padding: 28px 18px 60px;
+  }
+
+  .wrap {
+    max-width: 880px;
+    margin: 0 auto;
+  }
+
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+
+    margin-bottom: 26px;
+    flex-wrap: wrap;
+  }
+
+  .brand {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .eyebrow {
+    font-size: 12px;
+    letter-spacing: .14em;
+    text-transform: uppercase;
+    color: var(--mint);
+    font-weight: 700;
+  }
+
+  h1 {
+    margin: 0;
+    font-size: 26px;
+    font-weight: 800;
+    letter-spacing: -.01em;
+  }
+
+  h1 span {
+    color: var(--mint-bright);
+  }
+
+  .count-pill {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 9px 18px;
+    font-size: 13px;
+    color: var(--text-dim);
+    white-space: nowrap;
+  }
+
+  .count-pill b {
+    color: var(--mint-bright);
+    font-size: 15px;
+  }
+
+  .state-box {
+    border: 1px solid var(--border);
+    background: var(--card);
+    border-radius: 18px;
+    padding: 60px 24px;
+    text-align: center;
+    color: var(--text-dim);
+    font-size: 15px;
+  }
+
+  .state-box.error {
+    color: #ffb4b4;
+    border-color: rgba(255,120,120,.35);
+    background: rgba(255,80,80,.06);
+  }
+
+  .lead-list {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .lead-card {
+    border: 1px solid var(--border);
+    background: var(--card);
+    border-radius: 16px;
+    overflow: hidden;
+  }
+
+  .lead-card-top {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr auto;
+    gap: 14px;
+    align-items: center;
+
+    padding: 16px 20px;
+  }
+
+  .field {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    min-width: 0;
+  }
+
+  .field .label {
+    font-size: 10.5px;
+    text-transform: uppercase;
+    letter-spacing: .08em;
+    color: var(--text-dim);
+  }
+
+  .field .value {
+    font-size: 14.5px;
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .field .value.empty {
+    color: var(--text-dim);
+    font-weight: 400;
+    font-style: italic;
+  }
+
+  .time-badge {
+    font-size: 12px;
+    color: var(--text-dim);
+    white-space: nowrap;
+    text-align: right;
+  }
+
+  .transcript-toggle {
+    width: 100%;
+    text-align: left;
+    padding: 11px 20px;
+
+    background: rgba(255,255,255,.02);
+    border: none;
+    border-top: 1px solid var(--border);
+
+    color: var(--mint-bright);
+    font-size: 12.5px;
+    font-weight: 700;
+
+    cursor: pointer;
+
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .transcript-toggle .arrow {
+    transition: transform .15s ease;
+    font-size: 10px;
+  }
+
+  .transcript-toggle.open .arrow {
+    transform: rotate(90deg);
+  }
+
+  .transcript-panel {
+    display: none;
+    padding: 4px 20px 18px;
+
+    max-height: 380px;
+    overflow-y: auto;
+
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .transcript-panel.hidden {
+    display: none;
+  }
+
+  .transcript-msg {
+    max-width: 82%;
+    padding: 9px 13px;
+    border-radius: 12px;
+    font-size: 13.5px;
+    line-height: 1.4;
+  }
+
+  .transcript-msg.user {
+    align-self: flex-end;
+    background: rgba(29,209,161,.18);
+    border: 1px solid rgba(29,209,161,.3);
+  }
+
+  .transcript-msg.assistant {
+    align-self: flex-start;
+    background: rgba(255,255,255,.05);
+    border: 1px solid var(--border);
+  }
+
+  .transcript-msg .who {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: .06em;
+    color: var(--text-dim);
+    margin-bottom: 3px;
+  }
+
+  .transcript-empty {
+    padding: 10px 20px 18px;
+    color: var(--text-dim);
+    font-size: 13px;
+    font-style: italic;
+  }
+
+  @media (max-width: 720px) {
+    .lead-card-top {
+      grid-template-columns: 1fr 1fr;
+      row-gap: 10px;
+    }
+
+    .time-badge {
+      grid-column: 1 / -1;
+      text-align: left;
+      padding-top: 6px;
+      border-top: 1px solid var(--border);
+    }
+
+    .transcript-msg {
+      max-width: 92%;
+    }
+  }
+
+</style>
+</head>
+<body>
+
+  <div class="wrap">
+
+    <header>
+      <div class="brand">
+        <div class="eyebrow">Voice Agent</div>
+        <h1 id="pageTitle">Customer <span>Leads</span></h1>
+      </div>
+
+      <div class="count-pill" id="countPill" style="display:none;">
+        <b id="countNum">0</b> জন কথা বলেছে
+      </div>
+    </header>
+
+    <div id="content">
+      <div class="state-box" id="loadingBox">লোড হচ্ছে...</div>
+    </div>
+
+  </div>
+
+<script>
+
+  function qs(name) {
+    return new URLSearchParams(
+      window.location.search
+    ).get(name);
+  }
+
+  var agentId = qs("agentId");
+  var key = qs("key");
+
+  var contentEl =
+    document.getElementById("content");
+
+  var countPill =
+    document.getElementById("countPill");
+
+  var countNum =
+    document.getElementById("countNum");
+
+  var pageTitle =
+    document.getElementById("pageTitle");
+
+
+  function showError(message) {
+
+    contentEl.innerHTML =
+      '<div class="state-box error">' +
+        message +
+      '</div>';
+
+  }
+
+
+  function formatTime(iso) {
+
+    try {
+
+      var d = new Date(iso);
+
+      return d.toLocaleString(
+        "bn-BD",
+        {
+          dateStyle: "medium",
+          timeStyle: "short",
+        }
+      );
+
+    } catch (e) {
+
+      return iso;
+
+    }
+
+  }
+
+
+  function escapeHtml(text) {
+
+    return String(text || "")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
+
+  }
+
+
+  function fieldHtml(label, value) {
+
+    var safeValue = escapeHtml(value);
+
+    return (
+      '<div class="field">' +
+        '<div class="label">' + label + '</div>' +
+        '<div class="value' + (safeValue ? '' : ' empty') + '">' +
+          (safeValue || "দেওয়া হয়নি") +
+        '</div>' +
+      '</div>'
+    );
+
+  }
+
+
+  function transcriptHtml(transcript) {
+
+    if (!transcript || !transcript.length) {
+
+      return (
+        '<div class="transcript-empty">' +
+          'এই কলের কোনো কথোপকথন রেকর্ড হয়নি।' +
+        '</div>'
+      );
+
+    }
+
+    var html = '';
+
+    transcript.forEach(function (msg) {
+
+      var who =
+        msg.role === "user"
+          ? "কাস্টমার"
+          : "AI এজেন্ট";
+
+      html +=
+        '<div class="transcript-msg ' + msg.role + '">' +
+          '<div class="who">' + who + '</div>' +
+          escapeHtml(msg.text) +
+        '</div>';
+
+    });
+
+    return html;
+
+  }
+
+
+  function renderLeads(leads) {
+
+    if (!leads.length) {
+
+      contentEl.innerHTML =
+        '<div class="state-box">' +
+          'এখনো কেউ এজেন্টের সাথে কথা বলেনি। কাস্টমার কল শুরু করলে এখানে দেখা যাবে।' +
+        '</div>';
+
+      return;
+
+    }
+
+    var html = '<div class="lead-list">';
+
+    leads.forEach(function (lead, i) {
+
+      var hasTranscript =
+        lead.transcript && lead.transcript.length > 0;
+
+      html +=
+        '<div class="lead-card">' +
+          '<div class="lead-card-top">' +
+            fieldHtml("নাম", lead.name) +
+            fieldHtml("ফোন", lead.phone) +
+            fieldHtml("ইমেইল", lead.email) +
+            '<div class="time-badge">' +
+              formatTime(lead.timestamp) +
+            '</div>' +
+          '</div>' +
+          '<button type="button" class="transcript-toggle" data-index="' + i + '">' +
+            '<span class="arrow">▶</span>' +
+            (hasTranscript
+              ? 'কথোপকথন দেখুন (' + lead.transcript.length + ' মেসেজ)'
+              : 'কোনো কথোপকথন রেকর্ড হয়নি') +
+          '</button>' +
+          '<div class="transcript-panel hidden" id="transcript-' + i + '">' +
+            transcriptHtml(lead.transcript) +
+          '</div>' +
+        '</div>';
+
+    });
+
+    html += '</div>';
+
+    contentEl.innerHTML = html;
+
+    // toggle button গুলোতে click listener বসানো
+    var toggles =
+      contentEl.querySelectorAll(".transcript-toggle");
+
+    toggles.forEach(function (btn) {
+
+      btn.addEventListener("click", function () {
+
+        var idx = btn.getAttribute("data-index");
+
+        var panel =
+          document.getElementById("transcript-" + idx);
+
+        var isHidden =
+          panel.classList.contains("hidden");
+
+        panel.classList.toggle("hidden", !isHidden ? true : false);
+
+        if (isHidden) {
+          panel.classList.remove("hidden");
+          btn.classList.add("open");
+        } else {
+          panel.classList.add("hidden");
+          btn.classList.remove("open");
+        }
+
+      });
+
+    });
+
+  }
+
+
+  function load() {
+
+    if (!agentId || !key) {
+
+      showError(
+        "লিংকটা সঠিক না — agentId অথবা key মিসিং।"
+      );
+
+      return;
+
+    }
+
+    fetch(
+      "/api/agent/" +
+      encodeURIComponent(agentId) +
+      "/leads?key=" +
+      encodeURIComponent(key)
+    )
+      .then(function (res) {
+
+        if (res.status === 401) {
+          throw new Error(
+            "ভুল password/key — সঠিক admin লিংক ব্যবহার করুন।"
+          );
+        }
+
+        if (res.status === 404) {
+          throw new Error(
+            "এই এজেন্ট খুঁজে পাওয়া যায়নি।"
+          );
+        }
+
+        if (!res.ok) {
+          throw new Error(
+            "কিছু একটা সমস্যা হয়েছে।"
+          );
+        }
+
+        return res.json();
+
+      })
+      .then(function (data) {
+
+        if (data.siteName) {
+
+          pageTitle.innerHTML =
+            data.siteName +
+            ' <span>Leads</span>';
+
+        }
+
+        countPill.style.display = "flex";
+        countPill.style.display = "inline-flex";
+        countNum.textContent =
+          data.leads.length;
+
+        renderLeads(data.leads);
+
+      })
+      .catch(function (err) {
+
+        showError(err.message);
+
+      });
+
+  }
+
+  load();
+
+</script>
+
+</body>
+</html>
