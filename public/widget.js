@@ -59,6 +59,179 @@
 
 
   // ============================================================
+  // PAGE NAVIGATION + AUTO-RESUME System
+  //
+  // Customer বললে ("এই প্রোডাক্টটা দেখাও") agent server এ "open_page" টুল কল করে,
+  // server আমাদের { type: "navigate", url } পাঠায়। এই widget ওয়েবসাইটের ভেতরেই
+  // বসানো, তাই পেজ বদলালে ব্রাউজার রিলোড হয় আর WebSocket কেটে যায়।
+  // এজন্য:
+  //   1) agent এর কথা শেষ হওয়া পর্যন্ত অপেক্ষা করে তারপর পেজ খোলা হয়
+  //   2) নতুন পেজ লোড হলে widget নিজে থেকে call টা আবার চালু (resume) করে —
+  //      একই sid, নাম/ফোন/ইমেইল sessionStorage থেকে, আর greeting ছাড়াই
+  // ============================================================
+
+  var RESUME_KEY = "va_resume_" + AGENT_ID;
+
+  var RESUME_MAX_AGE_MS = 45000;
+
+  var currentSid = "";
+
+  var pendingNav = null;
+
+  var navAudioSeen = false;
+
+  var navTimer = null;
+
+
+  function newSid() {
+
+    try {
+
+      if (
+        window.crypto &&
+        window.crypto.randomUUID
+      ) {
+
+        return window.crypto.randomUUID();
+
+      }
+
+    } catch (e) {}
+
+    return (
+      "s" +
+      Date.now().toString(36) +
+      Math.random().toString(36).slice(2, 10)
+    );
+
+  }
+
+
+  function saveResume(reason) {
+
+    try {
+
+      sessionStorage.setItem(
+        RESUME_KEY,
+        JSON.stringify({
+          sid: currentSid,
+          name: nameInput.value.trim(),
+          phone: phoneInput.value.trim(),
+          email: emailInput.value.trim(),
+          nav: reason,
+          at: Date.now()
+        })
+      );
+
+    } catch (e) {}
+
+  }
+
+
+  function clearResume() {
+
+    try {
+
+      sessionStorage.removeItem(
+        RESUME_KEY
+      );
+
+    } catch (e) {}
+
+  }
+
+
+  function executeNavigation() {
+
+    if (!pendingNav) {
+      return;
+    }
+
+    var nav = pendingNav;
+
+    pendingNav = null;
+
+    clearTimeout(navTimer);
+
+    var target;
+
+    try {
+
+      target = new URL(
+        nav.url,
+        location.href
+      );
+
+    } catch (e) {
+
+      return;
+
+    }
+
+    // শুধু http/https (javascript: ইত্যাদি কখনোই না)
+    if (
+      target.protocol !== "http:" &&
+      target.protocol !== "https:"
+    ) {
+
+      return;
+
+    }
+
+    saveResume("agent");
+
+    location.assign(
+      target.href
+    );
+
+  }
+
+
+  // agent এর কথা (audio) পুরোটা বাজা শেষ হলে তারপর পেজ খোলা হয়
+  function scheduleNavigation() {
+
+    var remaining = 0;
+
+    if (outputCtx) {
+
+      remaining = Math.max(
+        0,
+        playHeadTime - outputCtx.currentTime
+      );
+
+    }
+
+    setTimeout(
+      executeNavigation,
+      remaining * 1000 + 350
+    );
+
+  }
+
+
+  // customer নিজে অন্য পেজে গেলে (লিংকে ক্লিক/রিফ্রেশ) call চললে সেটাও চালিয়ে যাওয়া হয়
+  window.addEventListener(
+    "pagehide",
+    function () {
+
+      try {
+
+        if (
+          sessionActive &&
+          !sessionStorage.getItem(RESUME_KEY)
+        ) {
+
+          saveResume("manual");
+
+        }
+
+      } catch (e) {}
+
+    }
+  );
+
+
+  // ============================================================
   // STYLE System
   // ============================================================
 
@@ -663,6 +836,72 @@
       display: block;
     }
 
+
+    /* ==========================================================
+   AI SPEAKING AVATAR ANIMATION
+========================================================== */
+
+#va-avatar {
+  position: relative;
+  transition:
+    transform .2s ease,
+    box-shadow .2s ease;
+}
+
+#va-avatar.ai-speaking {
+  animation: va-avatar-blink 0.9s ease-in-out infinite;
+}
+
+#va-avatar.ai-speaking::before {
+  content: "";
+  position: absolute;
+  inset: -7px;
+  border-radius: 50%;
+  border: 2px solid rgba(0, 245, 176, .55);
+  animation: va-avatar-ring 1.1s ease-out infinite;
+  pointer-events: none;
+}
+
+#va-avatar.ai-speaking::after {
+  content: "";
+  position: absolute;
+  inset: -13px;
+  border-radius: 50%;
+  border: 1px solid rgba(0, 245, 176, .25);
+  animation: va-avatar-ring 1.1s ease-out infinite .25s;
+  pointer-events: none;
+}
+
+@keyframes va-avatar-blink {
+  0%,
+  100% {
+    transform: scale(1);
+    box-shadow:
+      0 0 0 2px rgba(0,255,180,.10),
+      0 0 35px rgba(0,255,177,.25);
+  }
+
+  50% {
+    transform: scale(1.06);
+    box-shadow:
+      0 0 0 4px rgba(0,255,180,.18),
+      0 0 55px rgba(0,255,177,.65);
+  }
+}
+
+@keyframes va-avatar-ring {
+  0% {
+    transform: scale(.85);
+    opacity: .8;
+  }
+
+  100% {
+    transform: scale(1.18);
+    opacity: 0;
+  }
+}
+
+
     #va-avatar-placeholder svg {
       width: 62px;
       height: 62px;
@@ -998,14 +1237,36 @@
       fill: #fff;
     }
 
-    #va-orb.listening {
-      background:
-        rgba(0,239,175,.17);
 
-      box-shadow:
-        0 0 0 6px
-        rgba(0,239,175,.11);
-    }
+#va-orb.listening {
+  background:
+    rgba(0,239,175,.20);
+
+  box-shadow:
+    0 0 0 6px
+    rgba(0,239,175,.12);
+
+  animation:
+    va-mic-listening 0.8s ease-in-out infinite;
+}
+
+@keyframes va-mic-listening {
+  0%,
+  100% {
+    transform: scale(1);
+    box-shadow:
+      0 0 0 5px rgba(0,239,175,.10),
+      0 0 18px rgba(0,239,175,.15);
+  }
+
+  50% {
+    transform: scale(1.10);
+    box-shadow:
+      0 0 0 11px rgba(0,239,175,.04),
+      0 0 30px rgba(0,239,175,.38);
+  }
+}
+
 
     #va-orb.speaking {
       background:
@@ -1035,6 +1296,48 @@
       }
 
     }
+
+    /* ============================================================
+   MUTE BUTTON
+============================================================ */
+
+#va-mute-btn {
+  flex: 0 0 auto;
+  height: 51px;
+  min-width: 105px;
+  border-radius: 999px;
+  border: 1px solid rgba(255,255,255,.20);
+  background: rgba(255,255,255,.08);
+  color: #fff;
+  padding: 0 16px;
+  font-family: inherit;
+  font-size: 14px;
+  font-weight: 700;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  transition:
+    background .2s ease,
+    border .2s ease,
+    opacity .2s ease;
+}
+
+#va-mute-btn:hover:not(:disabled) {
+  background: rgba(255,255,255,.14);
+}
+
+#va-mute-btn:disabled {
+  opacity: .45;
+  cursor: not-allowed;
+}
+
+#va-mute-btn.muted {
+  background: rgba(255,70,70,.16);
+  border-color: rgba(255,90,90,.55);
+  color: #ff8a8a;
+}
 
 
     /* start call */
@@ -1250,6 +1553,23 @@
       }
 
     }
+
+    @media (max-width: 390px) {
+  #va-mute-btn {
+    min-width: 88px;
+    padding: 0 10px;
+    font-size: 12px;
+  }
+
+  #va-mic-btn {
+    padding: 0 12px;
+    font-size: 14px;
+  }
+
+  #va-call-row {
+    gap: 7px;
+  }
+}
 
   `;
 
@@ -1512,48 +1832,43 @@
 
       '<div id="va-title">' +
 
-        '<span class="brand">Fexa Agents</span> ' +
+        '<span class="brand">Faysal</span> ' +
 
-        '<span class="support">Support</span>' +
+        '<span class="support">Amin</span>' +
 
       '</div>' +
 
 
       '<div id="va-subtitle">' +
 
-        'Tap start call to connect' +
+        'Customer Executive' +
 
       '</div>' +
 
     '</div>' +
 
 
-    /* customer fields */
-
-    '<div id="va-user-form">' +
-
-      '<input ' +
-        'id="va-name" ' +
-        'class="va-input" ' +
-        'type="text" ' +
-        'placeholder="Your Name" ' +
-        'autocomplete="name">' +
-
-      '<input ' +
-        'id="va-phone" ' +
-        'class="va-input" ' +
-        'type="tel" ' +
-        'placeholder="Your Contact Number" ' +
-        'autocomplete="tel">' +
-
-      '<input ' +
-        'id="va-email" ' +
-        'class="va-input" ' +
-        'type="email" ' +
-        'placeholder="Your Email" ' +
-        'autocomplete="email">' +
-
-    '</div>' +
+   /* customer fields */
+'\<form id="va-user-form">' +
+  '\<input ' +
+    'id="va-name" ' +
+    'class="va-input" ' +
+    'type="text" ' +
+    'placeholder="Your Name" ' +
+    'autocomplete="name">' +
+  '\<input ' +
+    'id="va-phone" ' +
+    'class="va-input" ' +
+    'type="tel" ' +
+    'placeholder="Your Contact Number" ' +
+    'autocomplete="tel">' +
+  '\<input ' +
+    'id="va-email" ' +
+    'class="va-input" ' +
+    'type="email" ' +
+    'placeholder="Your Email" ' +
+    'autocomplete="email">' +
+'\</form>' +
 
 
     /* chat */
@@ -1575,7 +1890,7 @@
 
       '<div id="va-status">' +
 
-        'Ready to connect' +
+        'Fexa Agent' +
 
       '</div>' +
 
@@ -1594,6 +1909,10 @@
           '</svg>' +
 
         '</div>' +
+
+         '<button id="va-mute-btn" type="button" disabled>' +
+    '🎙️ Mute' +
+  '</button>' +
 
         '<button id="va-mic-btn" type="button">' +
 
@@ -1632,6 +1951,9 @@
       "#va-mic-btn"
     );
 
+    var muteBtn = panel.querySelector("#va-mute-btn");
+var isMuted = false;
+
   var soundBtn =
     panel.querySelector(
       "#va-sound-btn"
@@ -1651,6 +1973,11 @@
     panel.querySelector(
       "#va-orb"
     );
+
+    var avatarEl =
+  panel.querySelector(
+    "#va-avatar"
+  );
 
   var chatEl =
     panel.querySelector(
@@ -1679,6 +2006,25 @@
     panel.querySelector(
       "#va-email"
     );
+
+    [nameInput, phoneInput, emailInput].forEach(function (input) {
+  input.addEventListener("keydown", function (event) {
+    if (event.key === "Enter") {
+      event.preventDefault();
+
+      if (sessionActive) {
+        return;
+      }
+
+      startSession();
+    }
+  });
+});
+
+    var userForm =
+  panel.querySelector(
+    "#va-user-form"
+  );
 
 
   // ============================================================
@@ -1799,6 +2145,23 @@
 
     }
   );
+
+  // ============================================================
+// ENTER KEY / FORM SUBMIT System
+// ============================================================
+
+userForm.addEventListener(
+  "submit",
+  function (event) {
+    event.preventDefault();
+
+    if (sessionActive) {
+      return;
+    }
+
+    startSession();
+  }
+);
 
 
   // ============================================================
@@ -2266,6 +2629,13 @@
     sampleRate
   ) {
 
+    // navigate এর পর agent এর confirmation কথা এসেছে — এখন পেজ খোলার অপেক্ষা
+    if (pendingNav) {
+
+      navAudioSeen = true;
+
+    }
+
     if (!outputCtx) {
 
       outputCtx =
@@ -2276,6 +2646,31 @@
           sampleRate:
             sampleRate
         });
+
+      // পেজ রিলোডের পর ব্রাউজার auto-play আটকালে 🔊 বাটনে ট্যাপ করতে বলা হয়
+      if (outputCtx.state === "suspended") {
+
+        outputCtx.resume().catch(function () {});
+
+        setTimeout(
+          function () {
+
+            if (
+              outputCtx &&
+              outputCtx.state === "suspended"
+            ) {
+
+              setStatus(
+                "Tap 🔊 to enable sound"
+              );
+
+            }
+
+          },
+          600
+        );
+
+      }
 
     }
 
@@ -2354,68 +2749,79 @@
       buffer.duration;
 
 
-    orbEl.classList.add(
-      "speaking"
-    );
+   orbEl.classList.add(
+  "speaking"
+);
 
+avatarEl.classList.add(
+  "ai-speaking"
+);
 
-    src.onended =
-      function () {
+src.onended =
+  function () {
+    if (
+      outputCtx &&
+      outputCtx.currentTime >=
+        playHeadTime - 0.05
+    ) {
+      orbEl.classList.remove(
+        "speaking"
+      );
 
-        if (
-          outputCtx &&
-          outputCtx.currentTime >=
-            playHeadTime - 0.05
-        ) {
-
-          orbEl.classList.remove(
-            "speaking"
-          );
-
-        }
-
-      };
-
-  }
-
-
-  function stopPlayback() {
-
-    if (outputCtx) {
-
-      try {
-        outputCtx.close();
-      } catch (e) {}
-
-      outputCtx = null;
-
+      avatarEl.classList.remove(
+        "ai-speaking"
+      );
     }
-
-
-    playHeadTime = 0;
-
-
-    orbEl.classList.remove(
-      "speaking"
-    );
+  };
 
   }
+
+
+ function stopPlayback() {
+  if (outputCtx) {
+    try {
+      outputCtx.close();
+    } catch (e) {}
+
+    outputCtx = null;
+  }
+
+  playHeadTime = 0;
+
+  orbEl.classList.remove(
+    "speaking"
+  );
+
+  avatarEl.classList.remove(
+    "ai-speaking"
+  );
+}
 
 
   // ============================================================
   // START SESSION System
   // ============================================================
 
-  async function startSession() {
+  async function startSession(resumeInfo) {
 
     if (sessionActive) {
       return;
     }
 
 
-    if (!validateCustomerForm()) {
+    // পেজ খোলার পর auto-resume হলে ফর্ম আবার ভ্যালিডেট করা লাগে না
+    if (
+      !resumeInfo &&
+      !validateCustomerForm()
+    ) {
       return;
     }
+
+
+    currentSid =
+      (resumeInfo && resumeInfo.sid) ||
+      currentSid ||
+      newSid();
 
 
     setStatus(
@@ -2468,7 +2874,14 @@
         WS_BASE +
         "&name=" + encodeURIComponent(nameInput.value.trim()) +
         "&phone=" + encodeURIComponent(phoneInput.value.trim()) +
-        "&email=" + encodeURIComponent(emailInput.value.trim())
+        "&email=" + encodeURIComponent(emailInput.value.trim()) +
+        "&sid=" + encodeURIComponent(currentSid) +
+        "&page=" + encodeURIComponent(location.href) +
+        (
+          resumeInfo
+            ? "&resume=1&nav=" + encodeURIComponent(resumeInfo.nav || "agent")
+            : ""
+        )
       );
 
 
@@ -2510,30 +2923,66 @@
           msg.type === "ready"
         ) {
 
-          sessionActive =
-            true;
+         sessionActive =
+  true;
+
+panel.classList.add(
+  "in-call"
+);
+
+micBtn.disabled =
+  false;
+
+micBtn.innerHTML =
+  "⏹ Stop Call";
+
+isMuted = false;
+
+muteBtn.disabled = false;
+
+muteBtn.innerHTML = "🎙️ Mute";
+
+muteBtn.classList.remove("muted");
+
+setStatus(
+  "Listening... Talk"
+);
+
+beginMicStreaming();
 
 
-          panel.classList.add(
-            "in-call"
+          return;
+
+        }
+
+
+        // ======================================================
+        // NAVIGATE System (agent customer কে একটা পেজ খুলে দেখাচ্ছে)
+        // ======================================================
+
+        if (
+          msg.type === "navigate" &&
+          msg.url
+        ) {
+
+          pendingNav = {
+            url: msg.url,
+            title: msg.title || ""
+          };
+
+          navAudioSeen = false;
+
+          clearTimeout(navTimer);
+
+          // agent এর confirmation কথা না এলেও ৬ সেকেন্ড পর পেজ খুলবেই
+          navTimer = setTimeout(
+            scheduleNavigation,
+            6000
           );
-
-
-          micBtn.disabled =
-            false;
-
-
-          micBtn.innerHTML =
-            "⏹ Stop Call";
-
 
           setStatus(
-            "Listening... Talk"
+            "Opening page..."
           );
-
-
-          beginMicStreaming();
-
 
           return;
 
@@ -2620,9 +3069,21 @@
               null;
 
 
-            setStatus(
-              "Listening... Talk"
-            );
+            if (
+              pendingNav &&
+              navAudioSeen
+            ) {
+
+              // agent এর কথা শেষ, বাজা শেষ হলে পেজ খোলা হবে
+              scheduleNavigation();
+
+            } else if (!pendingNav) {
+
+              setStatus(
+                "Listening... Talk"
+              );
+
+            }
 
           }
 
@@ -2709,6 +3170,12 @@
       )({
         sampleRate: 16000
       });
+
+    if (inputCtx.state === "suspended") {
+
+      inputCtx.resume().catch(function () {});
+
+    }
 
 
     sourceNode =
@@ -2828,18 +3295,21 @@
           );
 
 
-        var b64 =
-          base64FromInt16(
-            pcm16
-          );
+       var b64 =
+  base64FromInt16(
+    pcm16
+  );
 
+if (isMuted) {
+  return;
+}
 
-        ws.send(
-          JSON.stringify({
-            type: "audio",
-            data: b64
-          })
-        );
+ws.send(
+  JSON.stringify({
+    type: "audio",
+    data: b64
+  })
+);
 
       };
 
@@ -2854,6 +3324,16 @@
 
     sessionActive =
       false;
+
+
+    // call শেষ (customer Stop চাপল / close করল) — resume ও pending navigation বাতিল
+    pendingNav = null;
+
+    clearTimeout(navTimer);
+
+    currentSid = "";
+
+    clearResume();
 
 
     panel.classList.remove(
@@ -2928,17 +3408,26 @@
     }
 
 
-    micBtn.disabled =
-      false;
+   micBtn.disabled =
+  false;
 
+micBtn.innerHTML =
+  "☎ Start Call";
 
-    micBtn.innerHTML =
-      "☎ Start Call";
+isMuted = false;
 
+muteBtn.disabled = true;
 
-    setStatus(
-      "Ready to connect"
-    );
+muteBtn.innerHTML =
+  "🎙️ Mute";
+
+muteBtn.classList.remove(
+  "muted"
+);
+
+setStatus(
+  "Ready to connect"
+);
 
 
     orbEl.classList.remove(
@@ -2978,6 +3467,53 @@
     }
   );
 
+  // ============================================================
+// MUTE / UNMUTE System
+// ============================================================
+
+muteBtn.addEventListener(
+  "click",
+  function () {
+
+    if (!sessionActive) {
+      return;
+    }
+
+    isMuted = !isMuted;
+
+    if (isMuted) {
+
+      muteBtn.innerHTML =
+        "🔇 Unmute";
+
+      muteBtn.classList.add(
+        "muted"
+      );
+
+      orbEl.classList.remove(
+        "listening"
+      );
+
+      setStatus(
+        "Microphone muted"
+      );
+
+    } else {
+
+      muteBtn.innerHTML =
+        "🎙️ Mute";
+
+      muteBtn.classList.remove(
+        "muted"
+      );
+
+      setStatus(
+        "Listening... Talk"
+      );
+    }
+  }
+);
+
 
   // ============================================================
   // SOUND BUTTON System
@@ -3003,6 +3539,16 @@
         }
 
 
+        if (
+          inputCtx &&
+          inputCtx.state === "suspended"
+        ) {
+
+          await inputCtx.resume();
+
+        }
+
+
         setStatus(
           "Sound enabled"
         );
@@ -3014,7 +3560,78 @@
 
 
   // ============================================================
-  // END System
+  // AUTO-RESUME System
+  // আগের পেজে call চলাকালীন পেজ বদলালে (agent খুলে দিলে বা customer নিজে গেলে)
+  // এই নতুন পেজে widget নিজে থেকে call টা আবার চালু করে।
   // ============================================================
 
+  (function autoResume() {
+
+    var raw = null;
+
+    try {
+
+      raw = sessionStorage.getItem(
+        RESUME_KEY
+      );
+
+      // একবারই কাজে লাগবে — না মুছলে রিফ্রেশে বারবার call শুরু হতো
+      sessionStorage.removeItem(
+        RESUME_KEY
+      );
+
+    } catch (e) {
+
+      return;
+
+    }
+
+    if (!raw) {
+      return;
+    }
+
+    var info;
+
+    try {
+
+      info = JSON.parse(raw);
+
+    } catch (e) {
+
+      return;
+
+    }
+
+    if (
+      !info ||
+      !info.sid ||
+      Date.now() - info.at > RESUME_MAX_AGE_MS
+    ) {
+
+      return;
+
+    }
+
+    nameInput.value = info.name || "";
+
+    phoneInput.value = info.phone || "";
+
+    emailInput.value = info.email || "";
+
+    panel.classList.add(
+      "open"
+    );
+
+    startSession({
+      sid: info.sid,
+      nav: info.nav
+    });
+
+  })();
+
+
+  // ============================================================
+  // END System
+  // ============================================================
+    
 })();

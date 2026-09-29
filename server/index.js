@@ -203,6 +203,16 @@ wss.on("connection", (ws, req) => {
   const customerPhone = url.searchParams.get("phone") || "";
   const customerEmail = url.searchParams.get("email") || "";
 
+  // Page navigation / auto-resume এর জন্য widget যা পাঠায়:
+  //   sid    = একটা call এর unique id (পেজ বদলালেও একই থাকে)
+  //   page   = customer এখন ব্রাউজারে যে URL দেখছে
+  //   resume = "1" হলে এটা আগের call এরই continuation (পেজ খোলার পর reconnect)
+  //   nav    = "agent" (agent পেজ খুলেছে) | "manual" (customer নিজে অন্য পেজে গেছে)
+  const sessionId = (url.searchParams.get("sid") || "").slice(0, 64);
+  const currentPage = (url.searchParams.get("page") || "").slice(0, 500);
+  const isResume = url.searchParams.get("resume") === "1";
+  const navReason = url.searchParams.get("nav") === "manual" ? "manual" : "agent";
+
   if (!agentId || !vectorStore.agentExists(agentId)) {
     ws.send(JSON.stringify({ type: "error", message: "Invalid or missing agentId" }));
     ws.close();
@@ -219,7 +229,8 @@ wss.on("connection", (ws, req) => {
 
   // customer er lead ekhon call SHESH hole (transcript soho) save hoy,
   // eijonyo liveSession.js e customer info pathiye dicchi
-  sendTelegramNotification(
+  // resume হলে (পেজ খোলার পর reconnect) একই কলের জন্য আবার notification পাঠানো হয় না
+  if (!isResume) sendTelegramNotification(
     `🔔 <b>নতুন কল শুরু হয়েছে</b>\n` +
     `🌐 সাইট: ${siteName}\n` +
     `👤 নাম: ${customerName || "N/A"}\n` +
@@ -235,6 +246,10 @@ wss.on("connection", (ws, req) => {
     customerName,
     customerPhone,
     customerEmail,
+    sessionId,
+    currentPage,
+    isResume,
+    navReason,
   });
 });
 

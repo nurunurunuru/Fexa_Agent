@@ -16,11 +16,25 @@ const WebSocket = require("ws");
 const { embedText } = require("./embeddings");
 const vectorStore = require("./vectorStore");
 const leads = require("./leads");
+const pageFinder = require("./pageFinder");
 
 const GEMINI_WS_URL =
   "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
 
 const SEARCH_TOOL_NAME = "search_website_info";
+const OPEN_PAGE_TOOL_NAME = "open_page";
+
+// একই call এর ধারাবাহিকতা: page navigation এর পর নতুন WebSocket এ call resume হলে
+// আগের কথোপকথন থেকে agent যেন context পায়।  key = `${agentId}:${sessionId}`
+const sessionHistories = new Map();
+const SESSION_HISTORY_TTL_MS = 30 * 60 * 1000;
+
+function pruneSessionHistories() {
+  const now = Date.now();
+  for (const [key, value] of sessionHistories) {
+    if (now - value.at > SESSION_HISTORY_TTL_MS) sessionHistories.delete(key);
+  }
+}
 
 // ============================================================
 // GEMINI LIVE SETUP System
@@ -95,6 +109,35 @@ function buildSetupMessage({ model, systemPrompt }) {
                 required: ["query"],
               },
             },
+
+            {
+              name: OPEN_PAGE_TOOL_NAME,
+
+              description:
+                "Open a page of this website in the customer's own browser. Use it when the customer asks to see, open, show or go to a specific page, product, category, service, pricing page, contact page, blog post, etc. Prefer passing the exact 'url' from the SITE MAP in the instructions. Otherwise pass a short 'query' in the website's own language (translate the product/page name if the customer speaks another language). Never invent a URL.",
+
+              parameters: {
+                type: "OBJECT",
+
+                properties: {
+                  query: {
+                    type: "STRING",
+
+                    description:
+                      "What the customer wants to see, e.g. 'red running shoes', 'pricing', 'contact us'. Use the website's own language.",
+                  },
+
+                  url: {
+                    type: "STRING",
+
+                    description:
+                      "Optional. The exact page URL copied from the SITE MAP, if one clearly matches.",
+                  },
+                },
+
+                required: ["query"],
+              },
+            },
           ],
         },
       ],
@@ -149,6 +192,87 @@ Do not say anything else.
 
 
 // ============================================================
+// NAVIGATION PROMPTS System
+// (site map + current page + resume context)
+// ============================================================
+
+function buildNavigationInstruction({ siteMap, phone }) {
+  if (!siteMap) return "";
+
+  return `
+
+NAVIGATION — OPENING WEBSITE PAGES FOR THE CUSTOMER:
+
+You can open pages of this website in the customer's own browser with the "${OPEN_PAGE_TOOL_NAME}" tool.
+
+- Use it whenever the customer asks to see, open, show, or be taken to a page, product, category, service, plan, pricing, contact page, blog post, order page, etc.
+  Examples: "show me this product", "open the pricing page", "ei product ta dekhao", "অর্ডার পেজে নিয়ে যাও".
+- When a page in the SITE MAP below clearly matches, pass its exact "url" (copy it exactly). Otherwise pass a short "query" written in the website's own language (translate names if the customer speaks another language).
+- NEVER invent or guess a URL. Only tell the customer a page is open if the tool result says opened is true.
+- Right after calling the tool, say ONE very short sentence in the customer's language (for example "Sure, opening it now." / "ঠিক আছে, পেজটা খুলে দিচ্ছি।") and then stop talking. The page will load and the call continues automatically.
+- If the tool result contains other_candidates and the customer says it is the wrong page, open the right one.
+- If no page matches, politely say you could not find that page, ask what exactly they are looking for, or offer the hotline ${phone}. Do not mention tools, systems, or databases.
+- Use "${SEARCH_TOOL_NAME}" to answer questions about details. Use "${OPEN_PAGE_TOOL_NAME}" only to show a page.
+- You know what each page contains from the SITE MAP, so when the customer asks "where can I find X?", tell them which page has it and offer to open it.
+
+SITE MAP (pages of this website — Title | URL | Description):
+${siteMap}
+`;
+}
+
+function buildCurrentPageInstruction(currentPage, info) {
+  if (!currentPage) return "";
+
+  if (!info) {
+    return `
+
+CURRENT PAGE:
+The customer's browser is currently on: ${currentPage}
+`;
+  }
+
+  const body =
+    info.text.length > 2500 ? info.text.slice(0, 2500) + "…" : info.text;
+
+  return `
+
+CURRENT PAGE (what the customer is looking at right now):
+Title: ${info.title}
+URL: ${info.url}
+Content of this page:
+${body}
+
+If the customer says "this", "this product", "this page", "এটা", "এই পেজ", "eita" and similar, they mean the page above. Answer from this content first; use "${SEARCH_TOOL_NAME}" only if you need more detail.
+`;
+}
+
+function buildPriorConversationInstruction(prior) {
+  if (!Array.isArray(prior) || prior.length === 0) return "";
+
+  const lines = prior
+    .slice(-12)
+    .map((m) => {
+      const who = m.role === "user" ? "Customer" : "You";
+      const text = String(m.text || "").replace(/\s+/g, " ").slice(0, 300);
+      return `${who}: ${text}`;
+    })
+    .join("\n");
+
+  return `
+
+CONVERSATION SO FAR (this call is continuing after a page change — you already greeted the customer, never greet or introduce yourself again; keep speaking in the language the customer has been using):
+${lines}
+`;
+}
+
+function buildResumeInstruction(info, currentPage) {
+  const name = (info && info.title) || currentPage || "the page";
+
+  return `The customer's browser has just finished loading the page "${name}" — this is the page you opened for them a moment ago. This is a CONTINUATION of the same call: do NOT greet again and do NOT introduce yourself again. In the language the customer has been using, say ONE very short sentence telling them the page is now open, then stop and wait for them. Do not read the page aloud unless they ask.`;
+}
+
+
+// ============================================================
 // START GEMINI BRIDGE System
 // ============================================================
 
@@ -160,10 +284,34 @@ function startBridge(browserWs, opts) {
     customerName,
     customerPhone,
     customerEmail,
+    sessionId,
+    currentPage,
+    isResume,
+    navReason,
   } = opts;
 
   // এই কলের পুরো কথোপকথন এখানে জমা হবে, কল শেষে leads এ সেভ হবে
   const transcriptLog = [];
+
+  // পেজ খোলার পর call resume হলে আগের কথোপকথন এখান থেকে পাওয়া যায়
+  const sessionKey = sessionId ? `${agentId}:${sessionId}` : null;
+
+  pruneSessionHistories();
+
+  let priorTranscript = [];
+
+  if (isResume && sessionKey && sessionHistories.has(sessionKey)) {
+    const previous = sessionHistories.get(sessionKey);
+    priorTranscript = previous.prior.concat(previous.log);
+  }
+
+  if (sessionKey) {
+    sessionHistories.set(sessionKey, {
+      prior: priorTranscript,
+      log: transcriptLog,
+      at: Date.now(),
+    });
+  }
 
   // Gemini transcript ছোট ছোট টুকরো (chunk) করে পাঠায়, তাই একই role এর
   // পরপর chunk গুলো একটা entry তেই জোড়া লাগানো হয় (আলাদা আলাদা না রেখে)
@@ -326,7 +474,25 @@ IMPORTANT MISSING WEBSITE INFORMATION RULE:
 - Keep the response short, natural, polite, and helpful.
 `;
 
-const finalSystemPrompt = systemPrompt + contactInstruction;
+// ==========================================================
+// SITE MAP + CURRENT PAGE + RESUME CONTEXT
+// ==========================================================
+
+const pages = pageFinder.getPages(agentStore);
+
+const currentPageInfo = currentPage
+  ? pageFinder.findPageByUrl(pages, currentPage)
+  : null;
+
+const finalSystemPrompt =
+  systemPrompt +
+  contactInstruction +
+  buildNavigationInstruction({
+    siteMap: pageFinder.buildSiteMap(pages),
+    phone,
+  }) +
+  buildCurrentPageInstruction(currentPage, currentPageInfo) +
+  buildPriorConversationInstruction(priorTranscript);
 
 
   // ==========================================================
@@ -521,6 +687,102 @@ Just ask the short follow-up question naturally.
 }
 
   // ==========================================================
+  // OPEN PAGE TOOL System
+  // Agent customer কে ওয়েবসাইটের কোনো পেজ খুলে দেখাতে চাইলে
+  // এখানে সঠিক পেজ খুঁজে browser কে "navigate" মেসেজ পাঠানো হয়।
+  // শুধু trained ওয়েবসাইটের পেজেই যাওয়া যায় (agent এর বানানো URL কখনো খোলা হয় না)।
+  // ==========================================================
+
+  async function handleOpenPage(call) {
+    const base = { id: call.id, name: call.name };
+
+    const query = String(call.args?.query || "").trim();
+    const requestedUrl = String(call.args?.url || "").trim();
+
+    console.log("🧭 open_page requested:", {
+      query,
+      url: requestedUrl,
+    });
+
+    let target = null;
+    let candidates = [];
+
+    if (requestedUrl) {
+      const hit = pageFinder.findPageByUrl(pages, requestedUrl);
+      if (hit) target = { url: hit.url, title: hit.title };
+    }
+
+    if (!target && (query || requestedUrl)) {
+      let hits = [];
+
+      try {
+        const embedding = await embedText(apiKey, query || requestedUrl);
+        hits = vectorStore.search(agentId, embedding, 12);
+      } catch (err) {
+        console.error("❌ open_page search error:", err.message);
+      }
+
+      candidates = pageFinder.rankPages(pages, query || requestedUrl, hits);
+      target = candidates[0] || null;
+    }
+
+    if (!target) {
+      console.log("🧭 open_page: no matching page");
+
+      return {
+        ...base,
+        response: {
+          opened: false,
+          message:
+            "No matching page was found on this website. Do not guess. Politely tell the customer, and ask what exactly they are looking for or offer the hotline number.",
+        },
+      };
+    }
+
+    if (currentPage && pageFinder.sameUrl(target.url, currentPage)) {
+      console.log("🧭 open_page: customer is already on this page");
+
+      return {
+        ...base,
+        response: {
+          opened: false,
+          already_on_this_page: true,
+          title: target.title,
+          message:
+            "The customer is already viewing this page. Tell them it is already open and offer to explain it.",
+        },
+      };
+    }
+
+    console.log(`🧭 Opening page: ${target.title} -> ${target.url}`);
+
+    if (browserWs.readyState === WebSocket.OPEN) {
+      browserWs.send(
+        JSON.stringify({
+          type: "navigate",
+          url: target.url,
+          title: target.title,
+        })
+      );
+    }
+
+    return {
+      ...base,
+      response: {
+        opened: true,
+        title: target.title,
+        url: target.url,
+        other_candidates: candidates
+          .filter((c) => c.url !== target.url)
+          .slice(0, 3)
+          .map((c) => ({ title: c.title, url: c.url })),
+        message:
+          "The page is being opened in the customer's browser right now. Say ONE very short confirmation sentence in the customer's language, then stop talking. The call continues automatically after the page loads.",
+      },
+    };
+  }
+
+  // ==========================================================
   // GEMINI OPEN System
   // ==========================================================
 
@@ -595,6 +857,42 @@ Just ask the short follow-up question naturally.
         // ----------------------------------------------------
         // SEND INITIAL ENGLISH GREETING System
         // ----------------------------------------------------
+
+        // পেজ খোলার পর reconnect: আবার greeting নয়। agent খুলে দিয়ে থাকলে
+        // ছোট্ট করে জানায় যে পেজটা খুলেছে; customer নিজে পেজ বদলালে চুপচাপ চালিয়ে যায়।
+        if (isResume && !greetingSent) {
+          greetingSent = true;
+
+          if (
+            navReason === "agent" &&
+            geminiWs.readyState === WebSocket.OPEN
+          ) {
+            console.log("↪️ Resuming call after page open (no greeting)");
+
+            geminiWs.send(
+              JSON.stringify({
+                clientContent: {
+                  turns: [
+                    {
+                      role: "user",
+                      parts: [
+                        {
+                          text: buildResumeInstruction(
+                            currentPageInfo,
+                            currentPage
+                          ),
+                        },
+                      ],
+                    },
+                  ],
+                  turnComplete: true,
+                },
+              })
+            );
+          } else {
+            console.log("↪️ Resuming call silently (no greeting)");
+          }
+        }
 
         if (!greetingSent) {
           greetingSent = true;
@@ -719,6 +1017,11 @@ Just ask the short follow-up question naturally.
           const call of msg.toolCall
             .functionCalls
         ) {
+          if (call.name === OPEN_PAGE_TOOL_NAME) {
+            responses.push(await handleOpenPage(call));
+            continue;
+          }
+
           if (
             call.name !==
             SEARCH_TOOL_NAME
@@ -1249,8 +1552,13 @@ if (sc.turnComplete) {
           name: customerName,
           phone: customerPhone,
           email: customerEmail,
+          sessionId,
           transcript: transcriptLog,
         });
+      }
+
+      if (sessionKey && sessionHistories.has(sessionKey)) {
+        sessionHistories.get(sessionKey).at = Date.now();
       }
 
       if (
