@@ -81,14 +81,50 @@ app.post("/api/train", async (req, res) => {
   try {
     if (!API_KEY) return res.status(500).json({ error: "Server GEMINI_API_KEY missing" });
 
-    const { websiteUrl, phone, email, address, siteName, representativeName, maxPages, systemPrompt } = req.body || {};
+    const body = req.body || {};
+
+    // ---- আগের agent রিফ্রেশ (একই agentId, তাই ক্লায়েন্টের সাইটের embed snippet বদলাতে হয় না) ----
+    // body: { agentId, adminKey }  (websiteUrl/phone/... না দিলে আগেরগুলোই থাকবে)
+    let existing = null;
+
+    if (body.agentId) {
+      const wantedId = String(body.agentId);
+
+      if (!/^[0-9a-fA-F-]{36}$/.test(wantedId)) {
+        return res.status(400).json({ error: "agentId ঠিক নেই" });
+      }
+
+      existing = vectorStore.loadStore(wantedId);
+
+      if (!existing) {
+        return res.status(404).json({ error: "agent পাওয়া যায়নি" });
+      }
+
+      if (!body.adminKey || body.adminKey !== existing.adminKey) {
+        return res.status(401).json({ error: "ভুল বা মিসিং adminKey" });
+      }
+    }
+
+    const pick = (v, old, fallback = "") =>
+      v !== undefined && v !== null && v !== "" ? v : (old ?? fallback);
+
+    const websiteUrl = pick(body.websiteUrl, existing && existing.siteUrl);
+    const phone = pick(body.phone, existing && existing.contactInfo && existing.contactInfo.phone);
+    const email = pick(body.email, existing && existing.contactInfo && existing.contactInfo.email);
+    const address = pick(body.address, existing && existing.contactInfo && existing.contactInfo.address);
+    const siteName = pick(body.siteName, existing && existing.siteName);
+    const representativeName = pick(body.representativeName, existing && existing.representativeName);
+    const systemPrompt = pick(body.systemPrompt, existing && existing.systemPrompt);
+    const { maxPages, maxDepth } = body;
+
     if (!websiteUrl) return res.status(400).json({ error: "websiteUrl আবশ্যক" });
 
-    const agentId = uuidv4();
-    const adminKey = crypto.randomBytes(16).toString("hex");
-    console.log(`[train] শুরু: ${websiteUrl} -> agentId ${agentId}`);
+    const agentId = existing ? existing.agentId : uuidv4();
+    const adminKey = existing ? existing.adminKey : crypto.randomBytes(16).toString("hex");
+    console.log(`[train] শুরু: ${websiteUrl} -> agentId ${agentId}${existing ? " (refresh)" : ""}`);
 
-    const { pages } = await crawlWebsite(websiteUrl, { maxPages: maxPages || 20 });
+    // maxPages না দিলে scraper এর default (১০০ পেজ) ব্যবহার হবে
+    const { pages } = await crawlWebsite(websiteUrl, { maxPages, maxDepth });
     if (!pages.length) {
       return res.status(422).json({ error: "কোনো কনটেন্ট বের করা গেল না, URL চেক করুন" });
     }
@@ -96,6 +132,13 @@ app.post("/api/train", async (req, res) => {
     const rawChunks = [];
     for (const page of pages) {
       const parts = chunkText(page.text);
+
+      // ছোট পেজ (যেমন কয়েক লাইনের Contact পেজ) থেকে chunk না হলেও পেজটা রাখা হয়,
+      // নইলে agent ওই পেজ চিনতে বা খুলে দিতে পারত না।
+      if (parts.length === 0 && page.text && page.text.trim()) {
+        parts.push(page.text.trim());
+      }
+
       for (const text of parts) {
         rawChunks.push({ url: page.url, title: page.title, text });
       }
@@ -147,7 +190,9 @@ app.post("/api/train", async (req, res) => {
 
     res.json({
       agentId,
+      refreshed: !!existing,
       pagesTrained: pages.length,
+      pageList: pages.map((p) => p.url),
       chunksCreated: chunks.length,
       embedSnippet,
       adminUrl,

@@ -20,8 +20,23 @@
 const { chromium } = require("playwright");
 const cheerio = require("cheerio");
 
-const DEFAULT_MAX_PAGES = 20;
-const DEFAULT_MAX_DEPTH = 2;
+// ওয়েবসাইটের সব পেজ (About, Contact, FAQ, Policy, Product ...) যেন পাওয়া যায়,
+// তাই default বড় রাখা হয়েছে। /api/train এ maxPages / maxDepth দিয়ে বদলানো যায়।
+const DEFAULT_MAX_PAGES = 100;
+const MAX_PAGES_LIMIT = 500;
+const DEFAULT_MAX_DEPTH = 4;
+
+// একসাথে কয়টা ট্যাবে ক্রল হবে (বেশি দিলে সাইট ব্লক করতে পারে)
+const CONCURRENCY = 3;
+
+// ক্রল সর্বোচ্চ কত সেকেন্ড চলবে। সময় শেষ হলে যতগুলো পেজ পাওয়া গেছে তা-ই নিয়ে
+// training চলবে (গুরুত্বপূর্ণ পেজ আগে ক্রল হয়, তাই About/Contact বাদ পড়ে না)।
+const CRAWL_TIME_LIMIT_MS =
+  (Number(process.env.CRAWL_MAX_SECONDS) || 240) * 1000;
+
+const MAX_QUEUE = 5000;
+const MAX_SITEMAP_FILES = 40;
+const MAX_SITEMAP_URLS = 5000;
 
 const PAGE_TIMEOUT = 30000;
 const NAVIGATION_TIMEOUT = 30000;
@@ -92,11 +107,166 @@ function isValidHttpUrl(url) {
 
 
 // ============================================================
+// SAME-SITE + CANONICAL URL System
+// example.com আর www.example.com কে একই সাইট ধরা হয়, এবং সব URL কে
+// শুরুর URL এর host এ নামিয়ে আনা হয় (যাতে widget সবসময় same-origin এ থাকে)।
+// ============================================================
+
+function bareHost(host) {
+  return String(host || "").toLowerCase().replace(/^www\./, "");
+}
+
+function sameSite(hostA, hostB) {
+  return bareHost(hostA) === bareHost(hostB);
+}
+
+function canonicalize(url, startObj) {
+  try {
+    const u = new URL(url);
+
+    if (u.protocol !== "http:" && u.protocol !== "https:") return null;
+    if (!sameSite(u.hostname, startObj.hostname)) return null;
+
+    u.protocol = startObj.protocol;
+    u.host = startObj.host;
+
+    return normalizeUrl(u.toString());
+  } catch {
+    return null;
+  }
+}
+
+
+// ============================================================
+// SKIP + PRIORITY System
+// ============================================================
+
+const SKIP_EXT =
+  /\.(pdf|jpe?g|png|gif|webp|svg|ico|bmp|avif|mp3|mp4|mov|avi|webm|zip|rar|7z|gz|tar|exe|dmg|apk|css|js|json|xml|txt|rss|woff2?|ttf|eot|docx?|xlsx?|pptx?|csv)$/i;
+
+const SKIP_SEGMENT =
+  /^(cart|checkout|basket|login|log-in|signin|sign-in|logout|register|signup|sign-up|my-account|account|wp-admin|wp-login\.php|wp-json|feed|xmlrpc\.php|cdn-cgi|wishlist|compare|order-tracking)$/i;
+
+const SKIP_QUERY =
+  /(^|[?&])(add-to-cart|add_to_cart|orderby|sort|filter|min_price|max_price|replytocom|wc-ajax|share|print)(=|&|$)/i;
+
+// কাজে লাগে না এমন URL (ছবি/ফাইল, cart, login, filter/sort ভ্যারিয়েন্ট) ক্রল করা হয় না
+function shouldSkipUrl(url) {
+  try {
+    const u = new URL(url);
+
+    if (SKIP_EXT.test(u.pathname)) return true;
+
+    const segments = u.pathname.split("/").filter(Boolean);
+    if (segments.some((seg) => SKIP_SEGMENT.test(seg))) return true;
+
+    if (u.search && SKIP_QUERY.test(u.search)) return true;
+
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+const INFO_SEGMENT =
+  /(about|contact|faq|help|support|polic|privacy|terms|refund|return|shipping|delivery|warranty|pricing|price|plan|service|team|career|job|location|branch|store-locator|company|who-we-are|why-us|how-it-works|testimonial|review|gallery|portfolio|payment|track|feature|solution|partner|mission|vision|history|news-and-events|office|hours)/i;
+
+const DEEP_SEGMENT =
+  /^(product|products|item|items|sku|blog|blogs|news|post|posts|article|articles|tag|tags|author|archive|archives)$/i;
+
+// কম সংখ্যা = আগে ক্রল হবে।
+//  -1 = হোম পেজ,  0 = About/Contact/FAQ/Policy/Pricing ধরনের তথ্যের পেজ,
+//   1 = অন্যান্য (category ইত্যাদি),  2 = আলাদা প্রোডাক্ট/ব্লগ পোস্ট (সংখ্যায় অনেক হয়)
+function urlPriority(url, startUrl) {
+  try {
+    const u = new URL(url);
+
+    if (normalizeUrl(url) === normalizeUrl(startUrl)) return -1;
+
+    const segments = u.pathname.split("/").filter(Boolean);
+
+    if (segments.length === 0) return -1;
+
+    if (segments.some((seg) => INFO_SEGMENT.test(seg))) return 0;
+
+    if (
+      segments.some((seg) => DEEP_SEGMENT.test(seg)) ||
+      /\/\d{4}\/\d{1,2}\//.test(u.pathname) ||
+      segments.length >= 4
+    ) {
+      return 2;
+    }
+
+    return 1;
+  } catch {
+    return 1;
+  }
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+
+// ============================================================
 // EXTRACT TEXT FROM HTML System
 // ============================================================
 
 function extractTextAndLinks(html, baseUrl) {
   const $ = cheerio.load(html);
+
+  // ==========================================================
+  // COLLECT LINKS System
+  //
+  // গুরুত্বপূর্ণ: লিংক আগে সংগ্রহ করা হয়, তারপর nav/header/footer মোছা হয়।
+  // (আগে উল্টোটা ছিল — তাই About, Contact, FAQ এর মতো পেজের লিংক, যেগুলো
+  //  সাধারণত menu / header / footer এ থাকে, কখনো খুঁজে পাওয়া যেত না।)
+  // ==========================================================
+
+  const base = new URL(baseUrl);
+  const links = new Set();
+
+  $("a[href], area[href]").each((_, el) => {
+    const href = $(el).attr("href");
+
+    if (!href) return;
+
+    const h = href.trim();
+
+    if (
+      h.startsWith("#") ||
+      /^(mailto:|tel:|javascript:|sms:|whatsapp:|data:)/i.test(h)
+    ) {
+      return;
+    }
+
+    try {
+      const absoluteUrl = new URL(h, baseUrl);
+
+      // Same site only (www / non-www একই ধরা হয়)
+      if (
+        sameSite(absoluteUrl.hostname, base.hostname) &&
+        (absoluteUrl.protocol === "http:" ||
+          absoluteUrl.protocol === "https:")
+      ) {
+        const normalized = normalizeUrl(absoluteUrl.toString());
+
+        if (normalized) {
+          links.add(normalized);
+        }
+      }
+    } catch {
+      // Ignore invalid URLs
+    }
+  });
+
+  // পেজের প্রধান heading (একাধিক পেজের <title> এক হলে আলাদা করতে কাজে লাগে)
+  const heading = $("h1")
+    .first()
+    .text()
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 120);
 
   // Remove elements that normally don't contain useful
   // website knowledge.
@@ -176,51 +346,9 @@ function extractTextAndLinks(html, baseUrl) {
       .trim();
   }
 
-  // ==========================================================
-  // COLLECT LINKS System
-  // ==========================================================
-
-  const base = new URL(baseUrl);
-  const links = new Set();
-
-  $("a[href]").each((_, el) => {
-    const href = $(el).attr("href");
-
-    if (!href) return;
-
-    if (
-      href.startsWith("#") ||
-      href.startsWith("mailto:") ||
-      href.startsWith("tel:") ||
-      href.startsWith("javascript:")
-    ) {
-      return;
-    }
-
-    try {
-      const absoluteUrl = new URL(href, baseUrl);
-
-      // Same domain only
-      if (
-        absoluteUrl.hostname === base.hostname &&
-        (absoluteUrl.protocol === "http:" ||
-          absoluteUrl.protocol === "https:")
-      ) {
-        const normalized = normalizeUrl(
-          absoluteUrl.toString()
-        );
-
-        if (normalized) {
-          links.add(normalized);
-        }
-      }
-    } catch {
-      // Ignore invalid URLs
-    }
-  });
-
   return {
     title,
+    heading,
     metaDescription,
     bodyText,
     links: Array.from(links),
@@ -244,7 +372,7 @@ async function waitForPage(page) {
   // Give JavaScript applications some time to render.
   try {
     await page.waitForLoadState("networkidle", {
-      timeout: 8000,
+      timeout: 5000,
     });
   } catch {
     // Many modern websites never become completely idle.
@@ -292,7 +420,12 @@ async function fetchRenderedPage(page, url) {
       return null;
     }
 
-    const result = extractTextAndLinks(html, url);
+    // redirect হলে (যেমন /about → /about-us) শেষ URL টাই ব্যবহার হবে
+    const finalUrl = page.url() || url;
+
+    const result = extractTextAndLinks(html, finalUrl);
+
+    result.finalUrl = finalUrl;
 
     console.log(
       `[scraper] Extracted ${result.bodyText.length} chars, ` +
@@ -312,75 +445,101 @@ async function fetchRenderedPage(page, url) {
 
 // ============================================================
 // SITEMAP DISCOVERY System
+//
+// robots.txt + /sitemap.xml + /sitemap_index.xml + /wp-sitemap.xml দেখা হয়।
+// Sitemap index (যেটা অন্য sitemap এর তালিকা) হলে ভেতরের sitemap গুলোও
+// পর্যন্ত খোলা হয় — Shopify / WordPress / WooCommerce সাইটে এটাই সব পেজের তালিকা।
 // ============================================================
 
-async function discoverSitemap(page, startUrl) {
+async function fetchText(url, timeoutMs = 15000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const res = await fetch(url, {
+      headers: {
+        "user-agent": USER_AGENT,
+        accept: "application/xml,text/xml,text/plain,*/*",
+      },
+      redirect: "follow",
+      signal: controller.signal,
+    });
+
+    if (!res.ok) return null;
+
+    const text = await res.text();
+
+    return text.length > 8_000_000 ? null : text;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function discoverSitemap(startUrl) {
   const start = new URL(startUrl);
 
-  const sitemapUrls = [
+  const seeds = new Set([
     `${start.origin}/sitemap.xml`,
     `${start.origin}/sitemap_index.xml`,
-  ];
+    `${start.origin}/wp-sitemap.xml`,
+  ]);
 
-  const discovered = new Set();
+  const robots = await fetchText(`${start.origin}/robots.txt`, 8000);
 
-  for (const sitemapUrl of sitemapUrls) {
-    try {
-      console.log(`[sitemap] Checking: ${sitemapUrl}`);
-
-      const response = await page.goto(sitemapUrl, {
-        waitUntil: "domcontentloaded",
-        timeout: 15000,
-      });
-
-      if (!response || response.status() >= 400) {
-        continue;
-      }
-
-      const contentType =
-        response.headers()["content-type"] || "";
-
-      const body = await page.content();
-
-      if (
-        contentType.includes("xml") ||
-        body.includes("<urlset") ||
-        body.includes("<sitemapindex")
-      ) {
-        const $ = cheerio.load(body, {
-          xmlMode: true,
-        });
-
-        $("loc").each((_, el) => {
-          const loc = $(el).text().trim();
-
-          if (!loc) return;
-
-          const normalized = normalizeUrl(loc);
-
-          if (!normalized) return;
-
-          try {
-            const u = new URL(normalized);
-
-            if (u.hostname === start.hostname) {
-              discovered.add(normalized);
-            }
-          } catch {
-            // Ignore invalid URLs
-          }
-        });
-      }
-    } catch {
-      // Sitemap is optional.
+  if (robots) {
+    for (const m of robots.matchAll(/^\s*sitemap:\s*(\S+)/gim)) {
+      seeds.add(m[1]);
     }
   }
 
-  console.log(
-    `[sitemap] Found ${discovered.size} URLs`
-  );
+  const stack = Array.from(seeds).map((url) => ({ url, depth: 0 }));
+  const seenMaps = new Set();
+  const found = new Set();
 
-  return Array.from(discovered);
+  let fetched = 0;
+
+  while (stack.length > 0 && fetched < MAX_SITEMAP_FILES) {
+    const { url, depth } = stack.shift();
+
+    if (seenMaps.has(url) || /\.gz$/i.test(url)) continue;
+
+    seenMaps.add(url);
+
+    console.log(`[sitemap] Checking: ${url}`);
+
+    const body = await fetchText(url);
+
+    fetched++;
+
+    if (!body) continue;
+
+    const isIndex = /<sitemapindex/i.test(body);
+    const isUrlset = /<urlset/i.test(body);
+
+    if (!isIndex && !isUrlset) continue;
+
+    const $ = cheerio.load(body, { xmlMode: true });
+
+    $("loc").each((_, el) => {
+      const loc = $(el).text().trim();
+
+      if (!loc) return;
+
+      if (isIndex) {
+        if (depth < 3) stack.push({ url: loc, depth: depth + 1 });
+      } else {
+        found.add(loc);
+      }
+    });
+
+    if (found.size >= MAX_SITEMAP_URLS) break;
+  }
+
+  console.log(`[sitemap] Found ${found.size} URLs`);
+
+  return Array.from(found);
 }
 
 
@@ -389,11 +548,13 @@ async function discoverSitemap(page, startUrl) {
 // ============================================================
 
 async function crawlWebsite(startUrl, opts = {}) {
-  const maxPages =
-    Number(opts.maxPages) || DEFAULT_MAX_PAGES;
+  const maxPages = Math.min(
+    Number(opts.maxPages) || DEFAULT_MAX_PAGES,
+    MAX_PAGES_LIMIT
+  );
 
   const maxDepth =
-    opts.maxDepth !== undefined
+    opts.maxDepth !== undefined && opts.maxDepth !== null
       ? Number(opts.maxDepth)
       : DEFAULT_MAX_DEPTH;
 
@@ -403,13 +564,14 @@ async function crawlWebsite(startUrl, opts = {}) {
     throw new Error("Invalid start URL");
   }
 
-  const startHost = new URL(start).hostname;
+  const startObj = new URL(start);
 
   console.log("======================================");
   console.log("🌐 Website crawler started");
   console.log(`URL: ${start}`);
   console.log(`Max pages: ${maxPages}`);
   console.log(`Max depth: ${maxDepth}`);
+  console.log(`Time limit: ${CRAWL_TIME_LIMIT_MS / 1000}s`);
   console.log("======================================");
 
   let browser;
@@ -428,169 +590,264 @@ async function crawlWebsite(startUrl, opts = {}) {
       locale: "en-US",
     });
 
-    const page = await context.newPage();
+    // ছবি/ভিডিও/ফন্ট লাগে না — না লোড করলে ক্রল অনেক দ্রুত হয়
+    await context.route("**/*", (route) => {
+      const type = route.request().resourceType();
 
-    page.setDefaultTimeout(PAGE_TIMEOUT);
+      if (type === "image" || type === "media" || type === "font") {
+        return route.abort();
+      }
+
+      return route.continue();
+    });
 
     // --------------------------------------------------------
-    // Queue System
+    // Queue System (priority অনুযায়ী: গুরুত্বপূর্ণ পেজ আগে)
     // --------------------------------------------------------
 
-    const queue = [
-      {
-        url: start,
-        depth: 0,
-      },
-    ];
-
-    const queued = new Set([start]);
+    const queue = [];
+    const queued = new Set();
     const visited = new Set();
-
     const pages = [];
+
+    let seq = 0;
+    let active = 0;
+
+    function enqueue(url, depth) {
+      const canon = canonicalize(url, startObj);
+
+      if (!canon) return false;
+      if (queued.has(canon)) return false;
+      if (canon !== start && shouldSkipUrl(canon)) return false;
+      if (queued.size >= MAX_QUEUE) return false;
+
+      queued.add(canon);
+
+      queue.push({
+        url: canon,
+        depth,
+        priority: urlPriority(canon, start),
+        seq: seq++,
+      });
+
+      return true;
+    }
+
+    function takeNext() {
+      if (queue.length === 0) return null;
+
+      let best = 0;
+
+      for (let i = 1; i < queue.length; i++) {
+        const a = queue[i];
+        const b = queue[best];
+
+        if (
+          a.priority < b.priority ||
+          (a.priority === b.priority && a.depth < b.depth) ||
+          (a.priority === b.priority &&
+            a.depth === b.depth &&
+            a.seq < b.seq)
+        ) {
+          best = i;
+        }
+      }
+
+      return queue.splice(best, 1)[0];
+    }
+
+    enqueue(start, 0);
 
     // --------------------------------------------------------
     // Discover sitemap System
     // --------------------------------------------------------
 
-    const sitemapLinks = await discoverSitemap(
-      page,
-      start
-    );
+    const sitemapLinks = await discoverSitemap(start);
 
-    // Add sitemap URLs before normal crawling.
+    let sitemapAdded = 0;
+
     for (const url of sitemapLinks) {
-      if (queued.size >= maxPages * 3) break;
-
-      if (!queued.has(url)) {
-        queued.add(url);
-
-        queue.push({
-          url,
-          depth: 1,
-        });
-      }
+      if (enqueue(url, 1)) sitemapAdded++;
     }
 
+    console.log(`[crawler] ${sitemapAdded} URLs added from sitemap`);
+
     // --------------------------------------------------------
-    // Crawl System
+    // Crawl System (CONCURRENCY টা ট্যাব একসাথে)
     // --------------------------------------------------------
 
-    while (
-      queue.length > 0 &&
-      pages.length < maxPages
-    ) {
-      const current = queue.shift();
+    const deadline = Date.now() + CRAWL_TIME_LIMIT_MS;
 
-      if (!current) continue;
+    let timedOut = false;
 
-      const { url, depth } = current;
+    async function worker(tab, workerId) {
+      while (true) {
+        if (pages.length >= maxPages) return;
 
-      if (visited.has(url)) {
-        continue;
-      }
+        if (Date.now() > deadline) {
+          timedOut = true;
+          return;
+        }
 
-      visited.add(url);
-
-      // Same domain safety check.
-      try {
-        const currentHost = new URL(url).hostname;
-
-        if (currentHost !== startHost) {
+        // maxPages এর বেশি পেজ যেন একসাথে না খোলা হয়
+        if (pages.length + active >= maxPages) {
+          if (active === 0) return;
+          await sleep(150);
           continue;
         }
-      } catch {
-        continue;
-      }
 
-      console.log(
-        `\n[crawler] ${pages.length + 1}/${maxPages}`
-      );
-      console.log(`[crawler] Depth: ${depth}`);
-      console.log(`[crawler] URL: ${url}`);
+        const current = takeNext();
 
-      const result = await fetchRenderedPage(
-        page,
-        url
-      );
+        if (!current) {
+          // অন্য ট্যাব নতুন লিংক আনতে পারে, তাই একটু অপেক্ষা
+          if (active === 0) return;
+          await sleep(150);
+          continue;
+        }
 
-      if (!result) {
-        continue;
-      }
+        const { url, depth } = current;
 
-      // ------------------------------------------------------
-      // Save page if useful content exists System
-      // ------------------------------------------------------
+        if (visited.has(url)) continue;
 
-      if (result.bodyText.length > 40) {
-        const finalText = [
-          result.title
-            ? `Title: ${result.title}`
-            : "",
-          result.metaDescription
-            ? `Description: ${result.metaDescription}`
-            : "",
-          result.bodyText,
-        ]
-          .filter(Boolean)
-          .join("\n");
+        visited.add(url);
 
-        pages.push({
-          url,
-          title: result.title || url,
-          text: finalText,
-        });
+        active++;
 
-        console.log(
-          `✅ Page saved: ${result.bodyText.length} chars`
-        );
-      } else {
-        console.log(
-          `⚠️ Not enough text: ${url}`
-        );
-      }
+        try {
+          console.log(
+            `\n[crawler#${workerId}] ${pages.length + 1}/${maxPages} ` +
+              `(depth ${depth}, priority ${current.priority}) ${url}`
+          );
 
-      // ------------------------------------------------------
-      // Discover more links System
-      // ------------------------------------------------------
+          const result = await fetchRenderedPage(tab, url);
 
-      if (depth < maxDepth) {
-        for (const link of result.links) {
-          if (visited.has(link)) continue;
-          if (queued.has(link)) continue;
+          if (!result) continue;
 
-          if (queue.length >= maxPages * 3) {
-            break;
-          }
+          // redirect এর পর শেষ URL — অন্য সাইটে গেলে বাদ, আগে দেখা হলে বাদ
+          const finalUrl = canonicalize(result.finalUrl || url, startObj);
 
-          try {
-            const linkHost =
-              new URL(link).hostname;
-
-            if (linkHost !== startHost) {
-              continue;
-            }
-          } catch {
+          if (!finalUrl) {
+            console.log(`⚠️ Redirected outside the site: ${url}`);
             continue;
           }
 
-          queued.add(link);
+          if (finalUrl !== url) {
+            if (visited.has(finalUrl)) {
+              console.log(`↪️ Already visited (redirect): ${finalUrl}`);
+              continue;
+            }
 
-          queue.push({
-            url: link,
-            depth: depth + 1,
-          });
+            visited.add(finalUrl);
+            queued.add(finalUrl);
+          }
+
+          // পেজে সামান্য লেখা থাকলেও রাখা হয় (Contact পেজ প্রায়ই ছোট) —
+          // নইলে agent ওই পেজ খুলে দিতে পারত না।
+          if (result.bodyText.length > 15 || result.title) {
+            const finalText = [
+              result.title ? `Title: ${result.title}` : "",
+              result.metaDescription
+                ? `Description: ${result.metaDescription}`
+                : "",
+              result.bodyText,
+            ]
+              .filter(Boolean)
+              .join("\n");
+
+            pages.push({
+              url: finalUrl,
+              title: result.title || result.heading || finalUrl,
+              heading: result.heading || "",
+              text: finalText,
+            });
+
+            console.log(
+              `✅ Page saved: ${result.bodyText.length} chars, ` +
+                `${result.links.length} links`
+            );
+          } else {
+            console.log(`⚠️ Not enough text: ${url}`);
+          }
+
+          // ------------------------------------------------------
+          // Discover more links System
+          // ------------------------------------------------------
+
+          if (depth < maxDepth) {
+            for (const link of result.links) {
+              if (visited.has(link)) continue;
+
+              enqueue(link, depth + 1);
+            }
+          }
+        } finally {
+          active--;
         }
       }
     }
 
+    const tabs = [];
+
+    for (let i = 0; i < CONCURRENCY; i++) {
+      const tab = await context.newPage();
+      tab.setDefaultTimeout(PAGE_TIMEOUT);
+      tabs.push(tab);
+    }
+
+    await Promise.all(tabs.map((tab, i) => worker(tab, i + 1)));
+
+    if (timedOut) {
+      console.log(
+        `⏱️ Time limit reached — using the ${pages.length} pages crawled so far`
+      );
+    }
+
+    // একাধিক পেজের <title> এক হলে (অনেক SPA তে হয়) heading/URL দিয়ে আলাদা করা হয়,
+    // যাতে agent "About" আর "Contact" আলাদা করে চিনতে পারে।
+    const titleCount = new Map();
+
+    for (const p of pages) {
+      titleCount.set(p.title, (titleCount.get(p.title) || 0) + 1);
+    }
+
+    for (const p of pages) {
+      if (titleCount.get(p.title) > 1) {
+        let label = p.heading;
+
+        if (!label) {
+          try {
+            const last = new URL(p.url).pathname
+              .split("/")
+              .filter(Boolean)
+              .pop();
+
+            label = last
+              ? decodeURIComponent(last).replace(/[-_]+/g, " ")
+              : "Home";
+          } catch {
+            label = "";
+          }
+        }
+
+        if (label && !p.title.includes(label)) {
+          p.title = `${label} – ${p.title}`;
+        }
+      }
+    }
+
+    // Home পেজ সবার আগে, বাকি গুলো URL অনুযায়ী
+    pages.sort((a, b) => {
+      const pa = urlPriority(a.url, start);
+      const pb = urlPriority(b.url, start);
+      return pa - pb || a.url.localeCompare(b.url);
+    });
+
     console.log("\n======================================");
-    console.log(
-      `✅ Crawling finished. Pages: ${pages.length}`
-    );
+    console.log(`✅ Crawling finished. Pages: ${pages.length}`);
     console.log("======================================");
 
     return {
-      pages,
+      pages: pages.slice(0, maxPages),
     };
   } finally {
     if (browser) {
