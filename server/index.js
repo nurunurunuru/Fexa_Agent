@@ -161,7 +161,7 @@ app.post("/api/train", async (req, res) => {
       embedding: embeddings[i],
     }));
 
-    vectorStore.saveStore(agentId, {
+    await vectorStore.saveStore(agentId, {
       agentId,
       siteName: siteName || new URL(websiteUrl).hostname,
       representativeName: representativeName || "Faisal",
@@ -222,20 +222,38 @@ app.get("/api/agent/:agentId", (req, res) => {
  * -> ওই agent এর সাথে কথা বলা customer দের list (নাম/ফোন/ইমেইল/সময়)
  * -> শুধু সঠিক adminKey দিলেই দেখা যাবে (train করার সময় পাওয়া key)
  */
-app.get("/api/agent/:agentId/leads", (req, res) => {
-  const store = vectorStore.loadStore(req.params.agentId);
-  if (!store) return res.status(404).json({ error: "agent পাওয়া যায়নি" });
+app.get("/api/agent/:agentId/leads", async (req, res) => {
+  try {
+    const store = vectorStore.loadStore(req.params.agentId);
 
-  const key = req.query.key;
-  if (!key || key !== store.adminKey) {
-    return res.status(401).json({ error: "ভুল বা মিসিং admin key" });
+    if (!store) {
+      return res.status(404).json({
+        error: "agent পাওয়া যায়নি",
+      });
+    }
+
+    const key = req.query.key;
+
+    if (!key || key !== store.adminKey) {
+      return res.status(401).json({
+        error: "ভুল বা মিসিং admin key",
+      });
+    }
+
+    const leadList = await leads.getLeads(store.agentId);
+
+    res.json({
+      agentId: store.agentId,
+      siteName: store.siteName,
+      leads: leadList,
+    });
+  } catch (error) {
+    console.error("Leads fetch error:", error);
+
+    res.status(500).json({
+      error: "Failed to load leads",
+    });
   }
-
-  res.json({
-    agentId: store.agentId,
-    siteName: store.siteName,
-    leads: leads.getLeads(store.agentId),
-  });
 });
 
 const server = http.createServer(app);
@@ -308,9 +326,21 @@ wss.on("connection", (ws, req) => {
  */
 app.post("/api/manychat-reply", messagingReply.handleManyChatRequest);
 
-server.listen(PORT,"0.0.0.0", () => {
-  console.log(`🚀 Server চলছে: http://localhost:${PORT}`);
-  console.log(`   Train:  POST http://localhost:${PORT}/api/train`);
-  console.log(`   Widget: GET  http://localhost:${PORT}/widget.js`);
-  console.log(`   Voice:  WS   ws://localhost:${PORT}/ws/voice?agentId=...`);
-});
+async function startServer() {
+  try {
+    await vectorStore.initVectorStore();
+    await leads.initLeads();
+
+    server.listen(PORT, "0.0.0.0", () => {
+      console.log(`🚀 Server চলছে: http://localhost:${PORT}`);
+      console.log(`   Train:  POST http://localhost:${PORT}/api/train`);
+      console.log(`   Widget: GET  http://localhost:${PORT}/widget.js`);
+      console.log(`   Voice:  WS   ws://localhost:${PORT}/ws/voice?agentId=...`);
+    });
+  } catch (error) {
+    console.error("❌ Server startup failed:", error);
+    process.exit(1);
+  }
+}
+
+startServer();

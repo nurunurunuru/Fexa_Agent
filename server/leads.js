@@ -1,48 +1,124 @@
-// server/leads.js
-// প্রতিটা agent (ওয়েবসাইট) এর customer leads (নাম/ফোন/ইমেইল + সময়) আলাদা
-// JSON ফাইলে সেভ রাখা হয়, যাতে admin webpage থেকে দেখা যায়।
-
 const fs = require("fs");
 const path = require("path");
 
-const LEADS_DIR = path.join(__dirname, "..", "data", "leads");
-if (!fs.existsSync(LEADS_DIR)) fs.mkdirSync(LEADS_DIR, { recursive: true });
+const { connectMongoDB, getDB } = require("./mongodb");
 
-function leadsPath(agentId) {
-  return path.join(LEADS_DIR, `${agentId}.json`);
+const LEADS_COLLECTION = "agent_leads";
+
+const LEADS_DIR = path.join(
+  __dirname,
+  "..",
+  "data",
+  "leads"
+);
+
+if (!fs.existsSync(LEADS_DIR)) {
+  fs.mkdirSync(LEADS_DIR, { recursive: true });
 }
 
-function writeLeads(agentId, list) {
-  // একটা agent এ বেশি leads জমে গেলে ফাইল যেন খুব বড় না হয়ে যায়
-  // (transcript soho thakay entry gulo age theke boro, tai limit kom rakha holo)
-  const trimmed = list.slice(0, 500);
+async function initLeads() {
+  await connectMongoDB();
 
-  fs.writeFileSync(
-    leadsPath(agentId),
-    JSON.stringify(trimmed, null, 2),
-    "utf-8"
-  );
+  const collection = getDB().collection(LEADS_COLLECTION);
+
+  await collection.createIndex({
+    agentId: 1,
+    timestamp: -1,
+  });
+
+  await collection.createIndex({
+    agentId: 1,
+    sessionId: 1,
+  });
+
+  // পুরোনো local lead files migrate করার চেষ্টা।
+  const files = fs
+    .readdirSync(LEADS_DIR)
+    .filter((file) => file.endsWith(".json"));
+
+  for (const file of files) {
+    const filePath = path.join(LEADS_DIR, file);
+    const agentId = path.basename(file, ".json");
+
+    try {
+      const oldLeads = JSON.parse(
+        fs.readFileSync(filePath, "utf-8")
+      );
+
+      if (!Array.isArray(oldLeads) || oldLeads.length === 0) {
+        continue;
+      }
+
+      const existingCount = await collection.countDocuments({
+        agentId,
+      });
+
+      if (existingCount > 0) {
+        continue;
+      }
+
+      const documents = oldLeads.slice(0, 500).map((lead) => ({
+        agentId,
+        name: lead.name || "",
+        phone: lead.phone || "",
+        email: lead.email || "",
+        sessionId: lead.sessionId || "",
+        transcript: Array.isArray(lead.transcript)
+          ? lead.transcript
+          : [],
+        timestamp:
+          lead.timestamp || new Date().toISOString(),
+        ...(lead.updatedAt
+          ? { updatedAt: lead.updatedAt }
+          : {}),
+      }));
+
+      await collection.insertMany(documents);
+
+      console.log(
+        `✅ Migrated ${documents.length} leads for ${agentId}`
+      );
+    } catch (error) {
+      console.error(
+        `⚠️ Lead migration failed for ${agentId}:`,
+        error.message
+      );
+    }
+  }
 }
 
-function addLead(agentId, lead) {
-  const list = getLeads(agentId);
-  const transcript = Array.isArray(lead.transcript) ? lead.transcript : [];
+async function addLead(agentId, lead) {
+  const collection = getDB().collection(LEADS_COLLECTION);
 
-  // Agent যখন কাস্টমারকে কোনো পেজ খুলে দেয়, ব্রাউজার রিলোড হয় আর call টা
-  // নতুন WebSocket এ auto-resume হয়। একই call (sessionId) এর transcript যেন
-  // আলাদা আলাদা lead না হয়ে একটা lead এই জোড়া লাগে, সেজন্য sessionId দিয়ে merge করা হয়।
+  const transcript = Array.isArray(lead.transcript)
+    ? lead.transcript
+    : [];
+
   if (lead.sessionId) {
-    const existing = list.find((l) => l.sessionId === lead.sessionId);
+    const existing = await collection.findOne({
+      agentId,
+      sessionId: lead.sessionId,
+    });
 
     if (existing) {
-      existing.transcript = (existing.transcript || []).concat(transcript);
-      existing.updatedAt = new Date().toISOString();
-      writeLeads(agentId, list);
+      await collection.updateOne(
+        { _id: existing._id },
+        {
+          $push: {
+            transcript: { $each: transcript },
+          },
+          $set: {
+            updatedAt: new Date().toISOString(),
+          },
+        }
+      );
+
       return;
     }
   }
 
-  list.unshift({
+  await collection.insertOne({
+    agentId,
     name: lead.name || "",
     phone: lead.phone || "",
     email: lead.email || "",
@@ -51,17 +127,37 @@ function addLead(agentId, lead) {
     timestamp: new Date().toISOString(),
   });
 
-  writeLeads(agentId, list);
-}
+  // আগের implementation-এর মতো সর্বোচ্চ 500টি lead রাখা।
+  const oldLeads = await collection
+    .find({ agentId })
+    .sort({ timestamp: -1 })
+    .skip(500)
+    .project({ _id: 1 })
+    .toArray();
 
-function getLeads(agentId) {
-  const p = leadsPath(agentId);
-  if (!fs.existsSync(p)) return [];
-  try {
-    return JSON.parse(fs.readFileSync(p, "utf-8"));
-  } catch (e) {
-    return [];
+  if (oldLeads.length > 0) {
+    await collection.deleteMany({
+      _id: {
+        $in: oldLeads.map((leadItem) => leadItem._id),
+      },
+    });
   }
 }
 
-module.exports = { addLead, getLeads };
+async function getLeads(agentId) {
+  const collection = getDB().collection(LEADS_COLLECTION);
+
+  const documents = await collection
+    .find({ agentId })
+    .sort({ timestamp: -1 })
+    .limit(500)
+    .toArray();
+
+  return documents.map(({ _id, agentId: storedAgentId, ...lead }) => lead);
+}
+
+module.exports = {
+  initLeads,
+  addLead,
+  getLeads,
+};

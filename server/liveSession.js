@@ -1547,15 +1547,17 @@ if (sc.turnComplete) {
       );
 
       // কল শেষে পুরো কথোপকথন সহ lead সেভ করা হয়
-      if (transcriptLog.length > 0) {
-        leads.addLead(agentId, {
-          name: customerName,
-          phone: customerPhone,
-          email: customerEmail,
-          sessionId,
-          transcript: transcriptLog,
-        });
-      }
+     if (transcriptLog.length > 0) {
+  leads.addLead(agentId, {
+    name: customerName,
+    phone: customerPhone,
+    email: customerEmail,
+    sessionId,
+    transcript: transcriptLog,
+  }).catch((error) => {
+    console.error("❌ Lead save failed:", error);
+  });
+}
 
       if (sessionKey && sessionHistories.has(sessionKey)) {
         sessionHistories.get(sessionKey).at = Date.now();
